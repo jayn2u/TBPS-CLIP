@@ -1,0 +1,40 @@
+[project]
+name = "tbps-clip"
+version = "0.1.0"
+description = "An Empirical Study of CLIP for Text-based Person Search"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "torchaudio>=2.2",
+    "timm>=0.6.11",
+    "wandb>=0.13.5",
+    "ftfy>=6.1.1",
+    "regex",
+    "easydict",
+    "pyyaml",
+    "textaugment",
+    "ipdb",
+    "torchmetrics",
+    "matplotlib",
+    "jupyter",
+    "ipykernel",
+    "nltk",
+    "numpy",
+    "pillow",
+]
+
+[tool.uv]
+package = false
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
