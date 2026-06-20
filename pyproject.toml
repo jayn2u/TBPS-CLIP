@@ -23,6 +23,7 @@ dependencies = [
     "nltk",
     "numpy",
     "pillow",
+    "gdown>=6.1.0",
 ]
 
 [tool.uv]

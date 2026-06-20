@@ -140,3 +140,12 @@ cython_debug/
 
 # IDEA
 .idea/
+
+# Training/evaluation artifacts
+ckpts/
+data/
+results/
+logs/
+*.pth
+*.pt
+*.zip
