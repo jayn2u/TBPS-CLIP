@@ -58,7 +58,7 @@ def load_checkpoint(model, config):
             else:
                 new_state[name] = params
     elif config.model.ckpt_type == 'saved':
-        ckpt = torch.load(os.path.join(config.model.saved_path), map_location='cpu')
+        ckpt = torch.load(os.path.join(config.model.saved_path), map_location='cpu', weights_only=False)
         new_state = ckpt['model']
     else:
         raise KeyError

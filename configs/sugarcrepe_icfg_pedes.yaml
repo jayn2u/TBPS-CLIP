@@ -1,0 +1,17 @@
+dataset: icfg-pedes
+dataset_root: /data/jayn2u/lab_datasets
+negative_pedestrians_root: /data/jayn2u/negative-pedestrians/outputs
+negative_model: gemma4:26b
+negative_prompt: tripletclip.yaml
+negative_annotation: auto
+tbps_config: config/s.config.yaml
+checkpoint: ckpts/f.baseline/ICFG-PEDES/checkpoint_best.pth
+model_label: TBPS-CLIP
+test_split: test
+batch_size: 64
+num_workers: 0
+device: auto
+seed: 42
+max_probes: 0
+output_json: ""
+no_amp: false

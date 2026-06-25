@@ -19,7 +19,13 @@ def parse_config(config_path):
 
 
 def is_using_distributed():
-    return True
+    return 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+
+
+def get_model_module(model):
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
 
 
 def is_dist_avail_and_initialized():
@@ -57,8 +63,14 @@ def init_distributed_mode(config):
         config.distributed.rank = int(os.environ['RANK'])
         config.distributed.world_size = int(os.environ['WORLD_SIZE'])
         config.distributed.local_rank = int(os.environ['LOCAL_RANK'])
+        init_method = config.distributed.url
+        if init_method == 'env://':
+            master_port = os.environ.get('MASTER_PORT', '29500')
+            init_method = f'tcp://127.0.0.1:{master_port}'
         torch.distributed.init_process_group(backend=config.distributed.backend,
-                                             init_method=config.distributed.url)
+                                             init_method=init_method,
+                                             rank=config.distributed.rank,
+                                             world_size=config.distributed.world_size)
         used_for_printing(get_rank() == 0)
 
     if torch.cuda.is_available():
