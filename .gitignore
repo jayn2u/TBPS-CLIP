@@ -148,4 +148,8 @@ results/
 logs/
 *.pth
 *.pt
+*.ckpt
+*.safetensors
 *.zip
+*.tar.gz
+artifacts/
