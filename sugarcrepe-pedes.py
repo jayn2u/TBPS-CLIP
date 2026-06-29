@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from collections import Counter, defaultdict
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +24,21 @@ from misc.utils import parse_config
 from model.tbps_model import clip_vitb
 from text_utils.tokenizer import tokenize
 
-PerturbationTag = Literal["swap_att", "replace_att", "other"]
+METHOD_REPLACE = "replace"
+METHOD_SWAP = "swap"
+METHOD_ADD = "add"
+METHOD_OTHER = "other"
+
+TYPE_OBJECT = "obj"
+TYPE_ATTRIBUTE = "att"
+TYPE_RELATION = "rel"
+TYPE_OTHER = "other"
+
+_TYPE_FULL_NAME = {
+    TYPE_OBJECT: "object",
+    TYPE_ATTRIBUTE: "attribute",
+    TYPE_RELATION: "relation",
+}
 
 DATASET_SPECS = {
     "cuhk-pedes": ("CUHK-PEDES", "reid_raw.json", "file_path"),
@@ -36,14 +50,64 @@ _COLOR_WORDS = frozenset(
     {
         "black", "white", "red", "blue", "green", "yellow", "gray", "grey",
         "brown", "pink", "purple", "orange", "beige", "navy", "tan", "gold",
-        "silver", "bright", "dark", "light", "neon",
+        "silver", "bright", "dark", "light", "neon", "khaki", "maroon", "violet",
+        "cyan", "teal", "cream", "ivory",
     }
 )
+_PATTERN_WORDS = frozenset(
+    {
+        "striped", "plaid", "checkered", "checked", "floral", "plain",
+        "patterned", "solid", "polka", "dotted", "camouflage", "camo", "denim",
+        "leather", "cotton", "wool", "woolen", "knit", "knitted", "fur", "furry",
+        "sleeveless", "long", "short", "sleeved", "tight", "loose", "baggy",
+        "skinny", "slim", "hooded", "collared", "buttoned", "ripped", "torn",
+        "shiny", "matte", "fluffy", "thick", "thin", "wide", "narrow", "curly",
+        "straight", "wavy", "bald", "sleeve", "sleeves",
+    }
+)
+_ATTRIBUTE_WORDS = _COLOR_WORDS | _PATTERN_WORDS
 _GARMENT_WORDS = frozenset(
     {
         "shirt", "jacket", "coat", "pants", "jeans", "trousers", "shorts",
         "skirt", "dress", "shoes", "sneakers", "boots", "hat", "cap", "hoodie",
-        "sweatshirt", "vest", "backpack", "bag", "top", "t-shirt", "tee",
+        "sweatshirt", "sweater", "cardigan", "blazer", "suit", "robe", "gown",
+        "leggings", "tights", "tracksuit", "jersey", "polo", "blouse", "tunic",
+        "overalls", "jumpsuit", "vest", "backpack", "bag", "top", "t-shirt",
+        "tee", "sandals", "heels", "loafers", "slippers", "gloves", "scarf",
+        "tie", "belt", "helmet", "mask", "glasses", "sunglasses", "watch",
+        "bracelet", "necklace", "earrings", "umbrella", "phone", "cellphone",
+        "handbag", "purse", "suitcase", "luggage", "briefcase", "satchel",
+        "wallet", "book", "books", "bottle", "cup", "box", "basket", "stroller",
+        "bicycle", "bike", "cart", "headphones", "earphones", "headband",
+        "ponytail", "bun", "hair", "beard", "mustache",
+    }
+)
+_OBJECT_WORDS = _GARMENT_WORDS
+_RELATION_WORDS = frozenset(
+    {
+        "left", "right", "behind", "front", "above", "below", "under", "over",
+        "beneath", "atop", "onto", "into", "beside", "next", "near", "top",
+        "bottom", "side", "back", "ahead", "across", "along", "around",
+        "between", "upon", "holding", "holds", "hold", "carrying", "carries",
+        "carry", "carried", "riding", "rides", "ride", "pushing", "pushes",
+        "push", "pulling", "pulls", "standing", "stands", "stand", "sitting",
+        "sits", "sit", "walking", "walks", "walk", "running", "runs", "run",
+        "leaning", "leans", "lean", "facing", "faces", "crossing", "crosses",
+        "cross", "climbing", "kneeling", "bending", "crouching", "jumping",
+        "lying",
+    }
+)
+_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "of", "to", "with", "is", "are", "was",
+        "were", "be", "been", "being", "in", "on", "at", "by", "as", "for",
+        "from", "this", "that", "these", "those", "he", "she", "it", "they",
+        "his", "her", "their", "its", "him", "them", "has", "have", "had",
+        "who", "which", "while", "also", "both", "very", "quite", "some",
+        "there", "appears", "seems", "seem", "appear", "wearing", "wears",
+        "wear", "worn", "dressed", "person", "man", "woman", "men", "women",
+        "pedestrian", "guy", "lady", "girl", "boy", "individual", "someone",
+        "people", "human", "subject",
     }
 )
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?", re.IGNORECASE)
@@ -77,7 +141,9 @@ class CompositionalProbe:
     positive_caption: str
     negative_caption: str
     caption_index: int
-    perturbation: PerturbationTag
+    perturbation: str
+    method: str
+    change_type: str
 
 
 def require_config_path(env_key: str, config_prefix: str) -> Path:
@@ -182,22 +248,69 @@ def tokenize_caption(text: str) -> set[str]:
     return {token.lower() for token in _TOKEN_RE.findall(text)}
 
 
-def tag_perturbation(positive_caption: str, negative_caption: str) -> PerturbationTag:
-    pos_tokens = tokenize_caption(positive_caption)
-    neg_tokens = tokenize_caption(negative_caption)
-    if not pos_tokens or not neg_tokens:
-        return "other"
-    union = pos_tokens | neg_tokens
-    overlap = len(pos_tokens & neg_tokens) / len(union)
-    pos_colors = pos_tokens & _COLOR_WORDS
-    neg_colors = neg_tokens & _COLOR_WORDS
-    pos_garments = pos_tokens & _GARMENT_WORDS
-    neg_garments = neg_tokens & _GARMENT_WORDS
-    if overlap >= 0.65 and pos_colors and neg_colors and pos_garments and neg_garments:
-        return "swap_att"
-    if overlap >= 0.45:
-        return "replace_att"
-    return "other"
+def _content_tokens(text: str) -> list[str]:
+    return [
+        token.lower()
+        for token in _TOKEN_RE.findall(text)
+        if token.lower() not in _STOPWORDS
+    ]
+
+
+def _resolve_change_type(tokens: set[str]) -> str:
+    has_relation = any(token in _RELATION_WORDS for token in tokens)
+    has_object = any(token in _OBJECT_WORDS for token in tokens)
+    has_attribute = any(token in _ATTRIBUTE_WORDS for token in tokens)
+    if has_relation:
+        return TYPE_RELATION
+    if has_object:
+        return TYPE_OBJECT
+    if has_attribute:
+        return TYPE_ATTRIBUTE
+    return TYPE_OTHER
+
+
+def _resolve_add_change_type(tokens: set[str]) -> str:
+    if any(token in _OBJECT_WORDS for token in tokens):
+        return TYPE_OBJECT
+    if any(token in _ATTRIBUTE_WORDS for token in tokens):
+        return TYPE_ATTRIBUTE
+    return TYPE_OTHER
+
+
+def classify_perturbation(
+    positive_caption: str, negative_caption: str
+) -> tuple[str, str]:
+    positive_tokens = _content_tokens(positive_caption)
+    negative_tokens = _content_tokens(negative_caption)
+    if not positive_tokens or not negative_tokens:
+        return METHOD_OTHER, TYPE_OTHER
+    positive_counts = Counter(positive_tokens)
+    negative_counts = Counter(negative_tokens)
+    if positive_counts == negative_counts:
+        if positive_tokens == negative_tokens:
+            return METHOD_OTHER, TYPE_OTHER
+        moved = {
+            token
+            for left, right in zip(positive_tokens, negative_tokens)
+            if left != right
+            for token in (left, right)
+        }
+        return METHOD_SWAP, _resolve_change_type(moved)
+    added = set(negative_counts - positive_counts)
+    removed = set(positive_counts - negative_counts)
+    if added and not removed:
+        return METHOD_ADD, _resolve_add_change_type(added)
+    if removed and not added:
+        return METHOD_ADD, _resolve_add_change_type(removed)
+    if added == removed:
+        return METHOD_SWAP, _resolve_change_type(added)
+    return METHOD_REPLACE, _resolve_change_type(added | removed)
+
+
+def perturbation_tag(method: str, change_type: str) -> str:
+    if method == METHOD_OTHER:
+        return METHOD_OTHER
+    return f"{method}_{change_type}"
 
 
 def load_compositional_probes(
@@ -233,6 +346,9 @@ def load_compositional_probes(
         for index in range(pair_count):
             positive_caption = pos_caps[index]
             negative_caption = neg_caps[index]
+            method, change_type = classify_perturbation(
+                positive_caption, negative_caption
+            )
             probes.append(
                 CompositionalProbe(
                     image_path=image_path,
@@ -240,7 +356,9 @@ def load_compositional_probes(
                     positive_caption=positive_caption,
                     negative_caption=negative_caption,
                     caption_index=index,
-                    perturbation=tag_perturbation(positive_caption, negative_caption),
+                    perturbation=perturbation_tag(method, change_type),
+                    method=method,
+                    change_type=change_type,
                 )
             )
             if max_probes and len(probes) >= max_probes:
@@ -261,15 +379,23 @@ def _cosine(left: torch.Tensor, right: torch.Tensor) -> float:
     return float((left.float() * right.float()).sum().item())
 
 
-def _ratio_metrics(correct_flags: list[bool]) -> dict[str, float]:
+def _bucket_metrics(
+    correct_flags: list[bool], margins: list[float]
+) -> dict[str, float]:
     total = len(correct_flags)
     if total == 0:
-        return {"count": 0.0, "discrimination_rate": 0.0, "random_chance": 0.0}
+        return {
+            "count": 0.0,
+            "correct": 0.0,
+            "discrimination_rate": 0.0,
+            "mean_margin": 0.0,
+        }
     correct = sum(1 for flag in correct_flags if flag)
     return {
         "count": float(total),
         "correct": float(correct),
         "discrimination_rate": correct / total,
+        "mean_margin": sum(margins) / total,
     }
 
 
@@ -280,40 +406,65 @@ def evaluate_sugarcrepe_probes(
     text_features: dict[str, torch.Tensor],
 ) -> dict[str, object]:
     overall_correct: list[bool] = []
-    margins: list[float] = []
-    by_tag: dict[PerturbationTag, list[bool]] = {
-        "swap_att": [],
-        "replace_att": [],
-        "other": [],
-    }
+    overall_margins: list[float] = []
     pos_sims: list[float] = []
     neg_sims: list[float] = []
+    fine_correct: dict[str, list[bool]] = defaultdict(list)
+    fine_margins: dict[str, list[float]] = defaultdict(list)
+    method_correct: dict[str, list[bool]] = defaultdict(list)
+    method_margins: dict[str, list[float]] = defaultdict(list)
+    type_correct: dict[str, list[bool]] = defaultdict(list)
+    type_margins: dict[str, list[float]] = defaultdict(list)
     for probe in probes:
         image_feat = image_features[probe.image_path]
-        pos_feat = text_features[probe.positive_caption]
-        neg_feat = text_features[probe.negative_caption]
-        pos_sim = _cosine(image_feat, pos_feat)
-        neg_sim = _cosine(image_feat, neg_feat)
+        pos_sim = _cosine(image_feat, text_features[probe.positive_caption])
+        neg_sim = _cosine(image_feat, text_features[probe.negative_caption])
         correct = pos_sim > neg_sim
+        margin = pos_sim - neg_sim
         overall_correct.append(correct)
-        margins.append(pos_sim - neg_sim)
-        by_tag[probe.perturbation].append(correct)
+        overall_margins.append(margin)
         pos_sims.append(pos_sim)
         neg_sims.append(neg_sim)
+        fine_correct[probe.perturbation].append(correct)
+        fine_margins[probe.perturbation].append(margin)
+        method_correct[probe.method].append(correct)
+        method_margins[probe.method].append(margin)
+        if probe.change_type in _TYPE_FULL_NAME:
+            type_key = _TYPE_FULL_NAME[probe.change_type]
+            type_correct[type_key].append(correct)
+            type_margins[type_key].append(margin)
+    overall = {
+        **_bucket_metrics(overall_correct, overall_margins),
+        "mean_positive_similarity": (
+            sum(pos_sims) / len(pos_sims) if pos_sims else 0.0
+        ),
+        "mean_negative_similarity": (
+            sum(neg_sims) / len(neg_sims) if neg_sims else 0.0
+        ),
+    }
     return {
         "benchmark": "sugarcrepe",
         "description": (
             "Image-conditioned hard-caption discrimination. "
-            "Given image I and captions (C+, C-), score 1 when sim(I, C+) > sim(I, C-)."
+            "Given image I and captions (C+, C-), score 1 when sim(I, C+) > sim(I, C-). "
+            "Perturbation method (replace/swap/add) and change type "
+            "(object/attribute/relation) are inferred from the positive/negative "
+            "token diff, mirroring the SugarCrepe taxonomy."
         ),
         "random_chance": 0.5,
-        "overall": {
-            **_ratio_metrics(overall_correct),
-            "mean_margin": sum(margins) / len(margins) if margins else 0.0,
-            "mean_positive_similarity": sum(pos_sims) / len(pos_sims) if pos_sims else 0.0,
-            "mean_negative_similarity": sum(neg_sims) / len(neg_sims) if neg_sims else 0.0,
+        "overall": overall,
+        "by_perturbation": {
+            tag: _bucket_metrics(fine_correct[tag], fine_margins[tag])
+            for tag in sorted(fine_correct)
         },
-        "by_perturbation": {tag: _ratio_metrics(flags) for tag, flags in by_tag.items()},
+        "by_method": {
+            method: _bucket_metrics(method_correct[method], method_margins[method])
+            for method in sorted(method_correct)
+        },
+        "by_type": {
+            type_key: _bucket_metrics(type_correct[type_key], type_margins[type_key])
+            for type_key in sorted(type_correct)
+        },
     }
 
 
@@ -509,14 +660,20 @@ def _print_metrics(metrics: dict[str, object]) -> None:
     print("SugarCrepe-style compositional discrimination")
     print(f"overall discrimination_rate: {overall['discrimination_rate']:.4f}")
     print(f"overall mean_margin: {overall['mean_margin']:.4f}")
-    by_perturbation = metrics["by_perturbation"]
-    assert isinstance(by_perturbation, dict)
-    for tag, payload in by_perturbation.items():
-        assert isinstance(payload, dict)
-        print(
-            f"{tag}: discrimination_rate={payload['discrimination_rate']:.4f} "
-            f"(n={int(payload['count'])})"
-        )
+    for group_key, title in (
+        ("by_method", "by method (replace / swap / add)"),
+        ("by_type", "by type (object / attribute / relation)"),
+        ("by_perturbation", "by fine-grained category"),
+    ):
+        group = metrics[group_key]
+        assert isinstance(group, dict)
+        print(title)
+        for tag, payload in group.items():
+            assert isinstance(payload, dict)
+            print(
+                f"  {tag}: discrimination_rate={payload['discrimination_rate']:.4f} "
+                f"(n={int(payload['count'])})"
+            )
 
 
 def main() -> None:
